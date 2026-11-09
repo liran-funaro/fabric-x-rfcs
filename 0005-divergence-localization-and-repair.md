@@ -84,9 +84,10 @@ The flow is the one from RFC 0004, with one addition: the snapshot transaction n
 tx := &applicationpb.Tx{
     Namespaces: []*applicationpb.TxNamespace{{
         NsId: committerpb.SnapshotNamespaceID, // "_snapshot"
-        BlindWrites: []*applicationpb.Write{{
-            Key:   []byte("bucket-bits"),
-            Value: []byte{16}, // K = 16, i.e. 65,536 buckets per table
+        ReadWrites: []*applicationpb.ReadWrite{{
+            Key:     []byte("bucket-bits"),
+            Version: nil,          // nil, as for a checkpoint
+            Value:   []byte{16},   // K = 16, i.e. 65,536 buckets per table
         }},
     }},
     // Endorsements satisfying SnapshotEndorsement.
@@ -280,11 +281,23 @@ byte-identical digest files.
 
 ### Where K comes from
 
-The snapshot transaction carries K. RFC 0004's `_snapshot` namespace is marker-only, and the sidecar
-rejects any write in it with `MALFORMED_SNAPSHOT_NOT_MARKER_ONLY`. SDLR changes the form check
-so that the namespace carries exactly one blind write: key `bucket-bits`, value one byte holding K.
-The VC's preparer copies K into the `SnapshotState` it creates for the snapshot. The write is
-consumed there and never committed as a row of `ns__snapshot`.
+The snapshot transaction carries K as its single read-write. This is the shape the `_checkpoint`
+namespace already requires: exactly one read-write with a nil version, and no reads-only or blind
+writes. The key is `bucket-bits` and the value is one byte holding K. RFC 0004's `_snapshot`
+namespace is marker-only, and the sidecar rejects any write in it with
+`MALFORMED_SNAPSHOT_NOT_MARKER_ONLY`. SDLR changes that form check to require the read-write.
+
+- **The read-write is never applied.** The VC's preparer replaces the `_snapshot` namespace with the
+  snapshot record it creates, and does not apply the transaction's own writes. So no snapshot
+  overwrites the previous snapshot's K. The preparer copies K into a new field of the record.
+- **K must survive the clone step.** When the VC creates the clone, it rebuilds the snapshot record
+  from scratch, so it must copy K forward. Every later status change edits the existing record, so K
+  survives those.
+- **The dependency it creates costs nothing.** The coordinator adds the read-write's key to its
+  dependency graph, so every snapshot transaction depends on the previous one. The sidecar already
+  drains before and after each snapshot transaction, so two are never in flight together.
+- **K is endorsed.** The namespace signature covers its read-writes, so `SnapshotEndorsement`
+  covers K.
 
 - **K's permitted range is a constant in code**, never node configuration. If two organizations
   allowed different ranges, a K inside one range and outside the other would make one organization
@@ -497,8 +510,10 @@ Producing them is the bootstrapping work's responsibility (see [Dependencies](#d
   - The bucketed digest scheme lives here, together with its normative test vectors, so that tools
     outside the committer can reproduce the same digests.
 - **fabric-x-committer**
-  - **Sidecar:** the `_snapshot` form check accepts exactly one `bucket-bits` blind write.
-  - **VC:** the preparer copies K into the `SnapshotState`.
+  - **Sidecar:** the `_snapshot` form check requires exactly one `bucket-bits` read-write with a nil
+    version, as the `_checkpoint` check does.
+  - **VC:** the preparer copies K into the `SnapshotState`, and the clone step carries it into the
+    rebuilt record.
   - **Snapshot hasher:** computes the bucketed scheme, stores the digests in the state database with
     the root, and excludes them from the hashed set.
   - **CLI:** a new `committer db divergence` group, next to `db init` and `db clone`, with `export`,
@@ -608,8 +623,12 @@ already in the flow. It remains an [open question](#unresolved-questions).
 - **Repair negatives:** a patch with rows that do not fix the divergence fails verification and leaves
   the evidence clone intact. A rollback whose replay blocks were pruned fails before changing anything.
   An interrupted repair resumes when run again.
-- **Form check:** a `_snapshot` transaction with K outside the permitted range, with a second write,
-  or with no write is rejected the same way by every committer.
+- **Form check:** a `_snapshot` transaction with K outside the permitted range, with a version on
+  its read-write, with a second write or a blind write, or with no write is rejected the same way by
+  every committer.
+- **K survives the lifecycle:** K set by the snapshot transaction is still on the record after the
+  clone step, `COMPLETED`, `CHECKPOINTED` and `ABORTED`. Two consecutive snapshots with different K
+  each keep their own.
 
 # Dependencies
 [dependencies]: #dependencies
