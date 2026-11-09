@@ -28,8 +28,8 @@ repairing them. This RFC defines those steps as State Divergence Localization an
    differing key, the transactions that wrote it and their block numbers.
 3. **Offline repair tools.** *Rollback* restores an older verified clone and replays the ledger.
    *Patch* restores the diverging clone, replaces the differing buckets with the peer's rows,
-   verifies the result, and replays. *Reset* replays from genesis. Each one ends by checking the hash
-   against the peer's.
+   verifies the result, and replays. *Reset* replays from genesis. Each one ends by checking the
+   repaired hash against the checkpoint, which the endorsers signed.
 
 # Motivation
 [motivation]: #motivation
@@ -56,7 +56,8 @@ The expected outcome:
   the differing buckets, not a database dump.
 - The report starts the root-cause analysis from a block number and a transaction ID, not from a hex
   key.
-- A repair ends with a hash that matches the peer's. A repair that has not been verified is not done.
+- A repair ends with a hash that matches the checkpoint the endorsers signed, not merely the hash of
+  one peer. A repair that has not been verified is not done.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
@@ -172,25 +173,25 @@ point. The modes differ in which clone they restore, and in what they do before 
 | reset    | none (empty database)       | none                                                 | from genesis               | no           |
 
 ```
-$ committer db divergence repair patch --clone snapshot_120000 --peer-rows rows-120000-orgB.bin \
-    --expect-root 0b4e…
+$ committer db divergence repair patch --clone snapshot_120000 --peer-rows rows-120000-orgB.bin
 restored state database from snapshot_120000 (clone renamed to snapshot_120000_evidence)
 replaced 4 buckets (2 tables, 9 rows)
 recomputed 4 bucket digests, reused 2,818,044
-root 0b4e… matches the expected root
+root 0b4e… matches the checkpoint hash for block 120000
 state database ready: resume from block 120000
 ```
 
 All three modes run offline, with the committer stopped. Each one can be re-run safely if it is
 interrupted.
 
-Patch is the fastest mode, but it has two costs, and operators should know them before choosing it:
+Patch does not have to trust the peer. The checkpoint transaction that halted the committer carries
+the hash a majority of endorsers signed. The repair compares the repaired root with that hash, so a
+peer that sent wrong rows produces a repair that fails, not a wrong state that commits. When the
+replay reaches the checkpoint again, the VC checks the hash once more, as it does for any checkpoint.
 
-- The repaired state is no longer the result of replaying the ledger.
-- Patch trusts that the peer's rows are correct. Two organizations alone cannot prove which of them
-  is right.
-
-Rollback and reset rebuild everything from the ledger, so they have neither cost.
+Patch's remaining cost is that the repaired state at the snapshot block was produced from the peer's
+rows, not by replaying the ledger. The hash proves it is the same state the endorsers attested to.
+Rollback and reset rebuild everything from the ledger, so they do not have this cost.
 
 ## Security and administration impact
 
@@ -427,6 +428,10 @@ repair starts:
   checkpoint.
 - **The halted checkpoint is not committed.** It gets no transaction status, and the sidecar
   re-delivers its block on the next start.
+- **The halt must record the checkpoint hash as a field.** The patch step verifies against it
+  offline, before the replay delivers the checkpoint again. Today the VC writes both hashes only into
+  the record's error text. fabric-x-common already defines a `SnapshotState.checkpoint_hash` field
+  for the hash that differed, and the halt should set it.
 
 ### Procedure
 
@@ -443,8 +448,9 @@ repair starts:
    makes the set of buckets to re-verify exactly the set that was replaced.
 4. **Patch only: verify before replay.** Recompute the digests of the replaced buckets, re-fold them
    with the stored digests of every other bucket into the table digests and the root, and check that
-   the root equals the peer's. Verification has to happen here, at the clone's point, because that is
-   the only height where the two organizations' states can be compared. Recomputing only the
+   the root equals the checkpoint hash. The checkpoint was signed by a majority of endorsers, so this
+   proves the result, not just agreement with one peer. Verification has to happen here, at the
+   clone's point, because that is the only height the checkpoint attests to. Recomputing only the
    replaced buckets is correct because step 2 guarantees that every other key is byte-identical to
    the content those stored digests were computed from.
 5. **Roll back the block store** to the block before the restored clone's snapshot block, using
@@ -457,8 +463,9 @@ repair starts:
    not the block after it: the clone holds that block's regular transactions but not its snapshot
    transaction. The regular transactions replay as duplicates, and the VC already resolves a
    duplicate to its original status.
-7. **Start the committer.** It replays forward. Rollback and reset are verified at the next snapshot,
-   by a full rehash, because they change every table and no stored bucket digest survives them.
+7. **Start the committer.** It replays forward. Rollback and reset are verified when the replay
+   reaches the halted checkpoint, by a full rehash, because they change every table and no stored
+   bucket digest survives them.
 
 ### Constraints
 
@@ -473,10 +480,19 @@ repair starts:
 
 ### The hold and halt path during replay
 
-RFC 0004's checkpoint verification still applies during replay. When the replayed checkpoint
-arrives, the VC compares it with the hash of the snapshot it just recreated. After a correct repair,
-the hashes match and the checkpoint commits. After an incorrect repair, the committer halts again,
-and the evidence clone is still there for another attempt.
+RFC 0004's checkpoint verification still applies during replay. The halted checkpoint was never
+committed, so it gets no transaction status, and the VC verifies it again when the replay
+re-delivers it. It compares the checkpoint with the hash of the snapshot it just recreated. After a
+correct repair the hashes match and the checkpoint commits. After an incorrect repair the committer
+halts again, and the evidence clone is still there for another attempt.
+
+This is what lets every mode be checked against the endorsers rather than against a peer:
+
+- **Patch** is checked twice: before the replay, against the stored checkpoint hash (step 4), and
+  again when the replay reaches the checkpoint. It can start ingesting the ledger as soon as step 4
+  passes.
+- **Rollback and reset** are checked when the replay reaches the halted checkpoint, by a full rehash
+  of the recreated snapshot. They do not have to wait for a later snapshot.
 
 ## Clone lifecycle
 
@@ -513,7 +529,7 @@ Producing them is the bootstrapping work's responsibility (see [Dependencies](#d
   - **Sidecar:** the `_snapshot` form check requires exactly one `bucket-bits` read-write with a nil
     version, as the `_checkpoint` check does.
   - **VC:** the preparer copies K into the `SnapshotState`, and the clone step carries it into the
-    rebuilt record.
+    rebuilt record. On a halt, the VC sets `SnapshotState.checkpoint_hash` to the checkpoint's hash.
   - **Snapshot hasher:** computes the bucketed scheme, stores the digests in the state database with
     the root, and excludes them from the hashed set.
   - **CLI:** a new `committer db divergence` group, next to `db init` and `db clone`, with `export`,
@@ -530,8 +546,10 @@ Producing them is the bootstrapping work's responsibility (see [Dependencies](#d
   before comparing.
 - **Storage per snapshot.** About 2.3 MB per table at K = 16, kept for as long as the clone. This is
   small next to the clone, but it is new state with its own failure modes.
-- **Patch trades reproducibility for speed.** The patched state is no longer the result of replaying
-  the ledger. Operators who need that guarantee must use rollback or reset.
+- **Patch's state does not come from the ledger.** The patched state at the snapshot block was
+  produced from the peer's rows, not by replaying the ledger. The checkpoint hash proves it matches
+  what the endorsers attested to, but operators who need the state rebuilt from the ledger itself
+  must use rollback or reset.
 - **Skew.** Keys that share prefixes put many rows in a few buckets, which makes rescanning a
   differing bucket slower. Giving `tx_status` 2K bits fixes this for the largest table, but not for
   application keys.
@@ -616,8 +634,10 @@ already in the flow. It remains an [open question](#unresolved-questions).
 - **Report:** a differing key must name the transaction that wrote it, at the right block and
   transaction number.
 - **Repair, end to end:** two committers with a deliberately diverged row. The checkpoint halts one.
-  Patch, rollback and reset must each bring it back to the peer's root, after which the replayed
+  Patch, rollback and reset must each bring it back to the checkpoint hash, after which the replayed
   checkpoint must commit.
+- **Patch with a wrong peer:** rows from a peer that also diverged must fail step 4 against the
+  checkpoint hash, before any block is replayed.
 - **Block store after repair:** after a repair that changes a transaction's status, the block store
   must record the new status for that transaction.
 - **Repair negatives:** a patch with rows that do not fix the divergence fails verification and leaves
