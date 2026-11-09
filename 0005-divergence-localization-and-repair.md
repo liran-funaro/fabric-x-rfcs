@@ -184,14 +184,17 @@ state database ready: resume from block 120000
 All three modes run offline, with the committer stopped. Each one can be re-run safely if it is
 interrupted.
 
-Patch does not have to trust the peer. The checkpoint transaction that halted the committer carries
-the hash a majority of endorsers signed. The repair compares the repaired root with that hash, so a
-peer that sent wrong rows produces a repair that fails, not a wrong state that commits. When the
-replay reaches the checkpoint again, the VC checks the hash once more, as it does for any checkpoint.
+No mode is trusted on its own; each one is proven by the checkpoint. The checkpoint transaction that
+halted the committer carries the hash a majority of endorsers signed, and every repair must reach it:
 
-Patch's remaining cost is that the repaired state at the snapshot block was produced from the peer's
-rows, not by replaying the ledger. The hash proves it is the same state the endorsers attested to.
-Rollback and reset rebuild everything from the ledger, so they do not have this cost.
+- **Patch** might receive wrong rows from the peer.
+- **Rollback and reset** replay the ledger through the same committer code that diverged in the first
+  place. If the bug is still there, or the divergence came from something other than the ledger, the
+  replay reaches the same wrong state.
+
+So all three end the same way: the repaired state's hash must equal the checkpoint hash. A repair
+that fails this check halts again at the checkpoint, and the evidence clone is still there for
+another attempt. Replaying the ledger proves nothing that the checkpoint does not.
 
 ## Security and administration impact
 
@@ -486,7 +489,8 @@ re-delivers it. It compares the checkpoint with the hash of the snapshot it just
 correct repair the hashes match and the checkpoint commits. After an incorrect repair the committer
 halts again, and the evidence clone is still there for another attempt.
 
-This is what lets every mode be checked against the endorsers rather than against a peer:
+This is what lets every mode be checked against the endorsers, rather than against a peer or against
+the assumption that a replay is correct:
 
 - **Patch** is checked twice: before the replay, against the stored checkpoint hash (step 4), and
   again when the replay reaches the checkpoint. It can start ingesting the ledger as soon as step 4
@@ -546,10 +550,9 @@ Producing them is the bootstrapping work's responsibility (see [Dependencies](#d
   before comparing.
 - **Storage per snapshot.** About 2.3 MB per table at K = 16, kept for as long as the clone. This is
   small next to the clone, but it is new state with its own failure modes.
-- **Patch's state does not come from the ledger.** The patched state at the snapshot block was
-  produced from the peer's rows, not by replaying the ledger. The checkpoint hash proves it matches
-  what the endorsers attested to, but operators who need the state rebuilt from the ledger itself
-  must use rollback or reset.
+- **A repair is only as good as the checkpoint.** Every mode is proven by matching a checkpoint the
+  endorsers signed. If no checkpoint verified the divergence, as in an aborted snapshot, there is
+  nothing to prove a repair against.
 - **Skew.** Keys that share prefixes put many rows in a few buckets, which makes rescanning a
   differing bucket slower. Giving `tx_status` 2K bits fixes this for the largest table, but not for
   application keys.
