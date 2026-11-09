@@ -16,7 +16,7 @@ nav_order: 3
 [RFC 0004 (Database Snapshot and Checkpoint)](https://github.com/hyperledger/fabric-x-rfcs/pull/8)
 lets organizations attest to a state hash, and it halts a committer whose state does not match the
 attested hash. It leaves the next steps as future work: finding where the states differ, and
-repairing them. This RFC defines those steps.
+repairing them. This RFC defines those steps as State Divergence Localization and Repair (SDLR).
 
 1. **Bucketed state digests.** The snapshot hasher stores a digest per table and per *bucket*, where
    a bucket is the set of rows whose keys share their first K bits. The root hash is derived from
@@ -45,8 +45,9 @@ transactions per second that is 8.6 billion rows a day. A full dump exchanged be
 organizations over a support call is not a realistic incident response.
 
 Fixing the divergence is equally manual. RFC 0004 says that recovery "depends on bootstrap-from-clone
-and rollback-to-a-block capabilities that are out of scope". Today no tool restores a clone, replays
-the ledger from it, and proves that the result matches the other organizations.
+and rollback-to-a-block capabilities that are out of scope". `committer db clone` lists and deletes
+snapshot clones, but no tool restores the state database from a clone, replays the ledger from it, or
+proves that the result matches the other organizations.
 
 The expected outcome:
 
@@ -254,7 +255,7 @@ values, and K = 16:
 | per-row binary Merkle tree                      | 0.8        | +279%                  | 64 B per row     |
 
 The third row is the cost of keeping today's root encoding byte-identical: every row has to be
-hashed twice. This RFC accepts a new root encoding to avoid that cost (see
+hashed twice. SDLR accepts a new root encoding to avoid that cost (see
 [Rationale](#alternatives)).
 
 The scan itself dominates the elapsed time. The hasher fetches and hashes each page in sequence.
@@ -270,7 +271,7 @@ same content, the same K and the same format version produce byte-identical dige
 ### Where K comes from
 
 The snapshot transaction carries K. RFC 0004's `_snapshot` namespace is marker-only, and the sidecar
-rejects any write in it with `MALFORMED_SNAPSHOT_NOT_MARKER_ONLY`. This RFC changes the form check
+rejects any write in it with `MALFORMED_SNAPSHOT_NOT_MARKER_ONLY`. SDLR changes the form check
 so that the namespace carries exactly one blind write: key `bucket-bits`, value one byte holding K.
 The VC's preparer copies K into the `SnapshotState` it creates for the snapshot. The write is
 consumed there and never committed as a row of `ns__snapshot`.
@@ -278,7 +279,7 @@ consumed there and never committed as a row of `ns__snapshot`.
 - **K's permitted range is a constant in code**, never node configuration. If two organizations
   allowed different ranges, a K inside one range and outside the other would make one organization
   accept the snapshot transaction and the other reject it. That would fork their `tx_status` tables,
-  which is the very divergence this RFC exists to find.
+  which is the very divergence SDLR exists to find.
 - **The submitter chooses K** within that range, for example from its own estimate of the row count.
   Agreement comes from the endorsed, ordered transaction, so a poor estimate costs a larger rescan
   of each differing bucket, and nothing else.
@@ -313,13 +314,13 @@ User namespaces keep K bits, and their skew remains. See
 ### Storage and lifetime
 
 The digests of a snapshot are kept for as long as its clone exists, and deleted with it. That ties
-them to RFC 0004's clone-deletion API, so they need no retention policy of their own.
+them to `committer db clone delete`, so they need no retention policy of their own.
 
 The digests are excluded from the hashed set, for the same reason `ns__snapshot` is: hashing them
 would fold each snapshot's digest into the next snapshot.
 
 At K = 16, the stored digests take at most 36 bytes per non-empty bucket: about 2.3 MB per table,
-and about 100 MB for a channel with 40 namespaces. This storage is the main overhead of the RFC.
+and about 100 MB for a channel with 40 namespaces. This storage is the main overhead of SDLR.
 Where the digests live is an [unresolved question](#unresolved-questions).
 
 ### Digest file format
@@ -344,7 +345,7 @@ report the change as a divergence.
 ## Compare protocol
 
 Compare is always two-sided. When a checkpoint verifies, no proof is needed. When it fails, the
-operator contacts the other organizations. So this RFC defines no inclusion proofs.
+operator contacts the other organizations. So SDLR defines no inclusion proofs.
 
 Each round is a file exchange between operators:
 
@@ -405,7 +406,7 @@ repair starts:
    reuses any database that already has the name. For the diverging snapshot, that would rehash the
    unrepaired clone, and the replayed checkpoint would halt again on the same mismatch.
 2. **Restore** the state database from the selected clone, discarding the current state. Reset
-   instead drops the database and initializes it empty, as `committer init-db` does.
+   instead drops the database and initializes it empty, as `committer db init` does.
 3. **Patch only:** replace each differing bucket's whole key range with the peer's rows for that
    range. Replacing whole buckets handles missing and extra rows without per-row diff logic, and it
    makes the set of buckets to re-verify exactly the set that was replaced.
@@ -450,13 +451,23 @@ and the evidence clone is still there for another attempt.
 
 Rollback is near-immediate only while the previous verified clone still exists. Patch depends on the
 diverging clone. The administrator decides whether to keep a clone, back it up and delete it, or
-delete it outright. This RFC needs two things from that lifecycle:
+delete it outright, using `committer db clone list` and `committer db clone delete`. The delete
+command works on the state database directly, and refuses a snapshot that is not `CHECKPOINTED` or
+`ABORTED`, because until then its clone may still be hashed.
 
-- **The clone-deletion RPC implemented.** RFC 0004 declares
-  `SidecarService.DeleteDBCloneForSnapshot`, but the committer currently answers it with
-  `UNIMPLEMENTED`.
-- **Documented guidance** to keep the last verified clone and any diverging clone until the
-  divergence is resolved.
+SDLR relies on that lifecycle in four ways:
+
+- **A verified clone is a `CHECKPOINTED` one.** An `ABORTED` snapshot was closed without comparing its
+  hash, so rollback never restores from its clone.
+- **The diverging clone is already protected.** A halt records the mismatch but leaves the snapshot's
+  status unchanged, so `db clone delete` refuses to delete the clone before a repair.
+- **The repair tracks its evidence clones.** A repair renames the clones the replay will pass (see
+  [Procedure](#procedure)). Restoring discards the `_snapshot` records that named them, and
+  `db clone delete` deletes only a clone that a record names. So the repair command records the
+  evidence clones it creates, and is the one that deletes them.
+- **Documented guidance** to keep the last `CHECKPOINTED` clone until the next snapshot is
+  checkpointed. `db clone delete` accepts any `CHECKPOINTED` clone, so the tool does not prevent
+  deleting the one that rollback needs.
 
 Backup files are produced only on demand, for a joining organization or a divergence, not routinely.
 Producing them is the bootstrapping work's responsibility (see [Dependencies](#dependencies)).
@@ -474,8 +485,8 @@ Producing them is the bootstrapping work's responsibility (see [Dependencies](#d
     digests from the hashed set.
   - **CLI:** a new `committer divergence` command group with `compare`, `export-rows`, `report` and
     `repair {patch,rollback,reset}`. Repair rolls back the sidecar's block store with fabric-x-common's
-    existing `blkstorage.Rollback`.
-  - **Clone deletion:** implements `DeleteDBCloneForSnapshot`.
+    existing `blkstorage.Rollback`, and tracks the evidence clones it creates (see
+    [Clone lifecycle](#clone-lifecycle)).
 
 # Drawbacks
 [drawbacks]: #drawbacks
@@ -511,7 +522,7 @@ states, and they support inclusion proofs. They are not chosen here, for two rea
 
 **Leaves indexed by row position.** Building the tree over row positions in primary-key order looks
 natural, but one missing row shifts every later leaf, so the whole tree diverges. A missing row from
-a mishandled transaction is exactly the case this RFC exists to find.
+a mishandled transaction is exactly the case SDLR exists to find.
 
 **Buckets by `H(key)`.** Hashing the key before taking its leading bits makes every table uniform,
 but a differing bucket is then scattered across the key space. Rescanning it becomes a filtered full
@@ -543,7 +554,7 @@ already in the flow. It remains an [open question](#unresolved-questions).
 - **Hyperledger Fabric `peer ledgerutil`.** `compare` diffs two peers' snapshot files and writes all
   differences, plus the first N ordered by height. `identifytxs` scans a peer's block store for the
   transactions that wrote given keys. `verify` checks block-store hashes. The compare tool and report
-  here follow `compare` and `identifytxs`. Fabric compares whole snapshot files, whereas this RFC
+  here follow `compare` and `identifytxs`. Fabric compares whole snapshot files, whereas SDLR
   compares digests first and exchanges only the differing rows. `verify` is out of scope.
 - **Anti-entropy in Dynamo and Cassandra.** Replicas exchange Merkle trees over key ranges, and
   descend only into ranges that differ. The bucket digests here are a single-level version of the same
@@ -582,7 +593,7 @@ already in the flow. It remains an [open question](#unresolved-questions).
 [dependencies]: #dependencies
 
 - **[RFC 0004 — Database Snapshot and Checkpoint](https://github.com/hyperledger/fabric-x-rfcs/pull/8).**
-  This RFC extends its snapshot transaction, hash and clone lifecycle.
+  SDLR extends its snapshot transaction, hash and clone lifecycle.
 - **Backup-to-file and bootstrapping**, which are being designed separately. Comparing against a
   backup file and resetting from a bootstrap snapshot depend on that work.
 - **Block-store pruning.** It decides which blocks a repair can replay.
@@ -593,7 +604,7 @@ already in the flow. It remains an [open question](#unresolved-questions).
 
 To resolve through the RFC process:
 
-- **How digests and rows are exchanged.** Strictly out-of-band files, as this RFC proposes, or a
+- **How digests and rows are exchanged.** Strictly out-of-band files, as SDLR proposes, or a
   committer API? A file fits the human step and the halted committer, but an API would allow
   automation.
 - **Where the digests are stored.** In a table in the state database, which needs a new exclusion
@@ -608,7 +619,8 @@ To resolve through the RFC process:
 To resolve during implementation:
 
 - The exact permitted range of K and its default.
-- The CLI command names, and whether they belong in the `committer` binary or in a separate tool.
+- The CLI command names, and whether they belong under the existing `committer db` group, in a new
+  group, or in a separate tool.
 - How the tool detects that no committer service is connected to the database.
 
 Out of scope:
