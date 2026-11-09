@@ -22,8 +22,9 @@ repairing them. This RFC defines those steps as State Divergence Localization an
    a bucket is the set of rows whose keys share their first K bits. The root hash is derived from
    these digests, so the extra data adds no measurable cost to hashing. The snapshot transaction
    carries K, so every organization uses the same value.
-2. **An offline compare tool.** Two organizations exchange digest files, find the differing buckets,
-   and then exchange only the rows of those buckets. The tool writes a report that names, for each
+2. **An offline compare tool.** Each organization exports its digests from its state database and
+   sends them to the other. The tool compares the received digests with the local ones, finds the
+   differing buckets, and then the two exchange only the rows of those buckets. The tool writes a report that names, for each
    differing key, the transactions that wrote it and their block numbers.
 3. **Offline repair tools.** *Rollback* restores an older verified clone and replays the ledger.
    *Patch* restores the diverging clone, replaces the differing buckets with the peer's rows,
@@ -67,10 +68,11 @@ The expected outcome:
 - **Bucket bits (K).** The number of leading key bits that select a bucket. The snapshot
   transaction carries K, so every organization hashes with the same K. `tx_status` uses 2K bits,
   because its keys are hex text (see [Key distribution](#key-distribution)).
-- **Digest file.** The output of hashing one snapshot: a header with the snapshot's block number,
-  K and a format version, then the root hash, then each table's digest and its non-empty bucket
-  digests. It takes at most about 2.3 MB per table at K = 16, and it is what organizations
-  exchange.
+- **Snapshot digests.** The output of hashing one snapshot: the root hash, each table's digest,
+  and its non-empty bucket digests, with the snapshot's block number, K and a format version. The
+  hasher stores them in the state database. They take at most about 2.3 MB per table at K = 16.
+- **Digest file.** The snapshot digests exported from the state database, for sending to another
+  organization. It is a transfer format only; the state database holds the stored copy.
 - **Diverging clone.** The clone of the snapshot whose hash did not match the checkpoint. It is never
   modified, and it stays available as evidence.
 
@@ -92,8 +94,8 @@ tx := &applicationpb.Tx{
 ```
 
 The hasher folds each row into its bucket digest. It derives each table's digest from the table's
-bucket digests, and the root from the table digests. It stores the result as the snapshot's digest
-file. Nothing else about snapshotting changes.
+bucket digests, and the root from the table digests. It stores the digests in the state database, in
+the same transaction that records the root. Nothing else about snapshotting changes.
 
 ## When a checkpoint halts the committer
 
@@ -106,12 +108,19 @@ local snapshot hash 7c21… for block 120000 does not match the checkpoint hash 
 
 The operator then works through these steps:
 
-1. **Contact another organization** whose hash matches the checkpoint, and exchange digest files for
-   snapshot block 120000.
-2. **Compare the digest files:**
+1. **Contact another organization** whose hash matches the checkpoint. Each organization exports
+   its digests for snapshot block 120000 and sends the file to the other:
 
    ```
-   $ committer divergence compare --local digests-120000-orgA.bin --peer digests-120000-orgB.bin
+   $ committer db divergence export --config vc.yaml --snapshot-block 120000 \
+       --out digests-120000-orgB.bin
+   ```
+
+2. **Compare the peer's digests** with the local ones. The command takes only the peer's file; it
+   reads the local digests from the state database:
+
+   ```
+   $ committer db divergence compare --config vc.yaml --peer digests-120000-orgB.bin
    snapshot block 120000, K=16, format v1
    root      MISMATCH
    tables    41 match, 2 differ
@@ -124,14 +133,14 @@ The operator then works through these steps:
    back a small file:
 
    ```
-   $ committer divergence export-rows --clone snapshot_120000 --request request-120000.json \
+   $ committer db divergence export-rows --clone snapshot_120000 --request request-120000.json \
        --out rows-120000-orgB.bin
    ```
 
 4. **Write the report:**
 
    ```
-   $ committer divergence report --clone snapshot_120000 --peer-rows rows-120000-orgB.bin \
+   $ committer db divergence report --clone snapshot_120000 --peer-rows rows-120000-orgB.bin \
        --ledger /var/hyperledger/ledger --out divergence-120000/
    ```
 
@@ -162,7 +171,7 @@ point. The modes differ in which clone they restore, and in what they do before 
 | reset    | none (empty database)       | none                                                 | from genesis               | no           |
 
 ```
-$ committer divergence repair patch --clone snapshot_120000 --peer-rows rows-120000-orgB.bin \
+$ committer db divergence repair patch --clone snapshot_120000 --peer-rows rows-120000-orgB.bin \
     --expect-root 0b4e…
 restored state database from snapshot_120000 (clone renamed to snapshot_120000_evidence)
 replaced 4 buckets (2 tables, 9 rows)
@@ -266,7 +275,8 @@ hashing, for page latencies between 3 ms and 0.3 ms. This has not been measured 
 
 The digests depend only on table content, K and the format version. They do not depend on page size,
 worker count, the order in which tables finish, or the number of nodes. Two organizations with the
-same content, the same K and the same format version produce byte-identical digest files.
+same content, the same K and the same format version store identical digests, and export
+byte-identical digest files.
 
 ### Where K comes from
 
@@ -319,9 +329,13 @@ them to `committer db clone delete`, so they need no retention policy of their o
 The digests are excluded from the hashed set, for the same reason `ns__snapshot` is: hashing them
 would fold each snapshot's digest into the next snapshot.
 
+The hasher writes the digests in the same transaction that moves the snapshot record to
+`COMPLETED` and records the root. So a committed root always has its digests, and a crash during
+hashing leaves neither.
+
 At K = 16, the stored digests take at most 36 bytes per non-empty bucket: about 2.3 MB per table,
-and about 100 MB for a channel with 40 namespaces. This storage is the main overhead of SDLR.
-Where the digests live is an [unresolved question](#unresolved-questions).
+and about 100 MB for a channel with 40 namespaces. This storage is the main overhead of SDLR. Which
+database structure holds them is an [unresolved question](#unresolved-questions).
 
 ### Digest file format
 
@@ -333,10 +347,11 @@ tables   uint32 count, then for each table in combine order:
            ‖ { uint32 bucket ‖ digest (32) } × non_empty_buckets
 ```
 
-The header makes the file self-describing. A clone does not contain its own `_snapshot` record,
-because the clone is created before the snapshot transaction commits. So without the header, a tool
-holding only a clone or a backup file could not learn K, and an operator would have to supply it by
-hand, under pressure, during an incident.
+`committer db divergence export` writes this format. The header makes the file self-describing, so
+the receiving organization learns the snapshot block, K and format version from the file alone, and
+no operator has to supply them by hand, under pressure, during an incident. The stored digests carry
+the same three values. They cannot be read from the clone, because a clone does not contain its own
+`_snapshot` record: it is created before the snapshot transaction commits.
 
 The format version matters for repairs over time, not between organizations. A rollback rehashes an
 older clone, and if the hashing scheme changed since, the tool must refuse and say so. It must not
@@ -347,20 +362,23 @@ report the change as a divergence.
 Compare is always two-sided. When a checkpoint verifies, no proof is needed. When it fails, the
 operator contacts the other organizations. So SDLR defines no inclusion proofs.
 
-Each round is a file exchange between operators:
+Each round is a file exchange between operators. A sent file always holds the sender's data; the
+receiver's side always comes from its own state database:
 
 | round | sent                          | size (1-billion-row table, K = 16) | narrows to             |
 |-------|-------------------------------|------------------------------------|------------------------|
 | 0     | root hash                     | already known from the halt        | does the state differ? |
-| 1     | digest files                  | ~2 MB per table                    | the differing buckets  |
+| 1     | exported digests              | ~2 MB per table                    | the differing buckets  |
 | 2     | rows of the differing buckets | ~15,000 rows per bucket (~1 MB)    | the differing rows     |
 
 The tool reads the peer's rows and its own rows for each requested bucket, with a range scan, and
 diffs them by key. Each bucket is a contiguous key range, so this is one index seek per bucket. A
 missing or extra row affects only the bucket that contains it.
 
-The tool checks that both files name the same snapshot block, K and format version, and refuses to
-compare them otherwise.
+Compare takes only the peer's digest file. The local digests come from the state database, never
+from a file, so an operator cannot compare against a stale or mistaken local export. The tool checks
+that the peer's file names the same snapshot block, K and format version as the local record, and
+refuses to compare them otherwise.
 
 ## Report
 
@@ -481,10 +499,10 @@ Producing them is the bootstrapping work's responsibility (see [Dependencies](#d
 - **fabric-x-committer**
   - **Sidecar:** the `_snapshot` form check accepts exactly one `bucket-bits` blind write.
   - **VC:** the preparer copies K into the `SnapshotState`.
-  - **Snapshot hasher:** computes the bucketed scheme, writes the digest file, and excludes the stored
-    digests from the hashed set.
-  - **CLI:** a new `committer divergence` command group with `compare`, `export-rows`, `report` and
-    `repair {patch,rollback,reset}`. Repair rolls back the sidecar's block store with fabric-x-common's
+  - **Snapshot hasher:** computes the bucketed scheme, stores the digests in the state database with
+    the root, and excludes them from the hashed set.
+  - **CLI:** a new `committer db divergence` group, next to `db init` and `db clone`, with `export`,
+    `compare`, `export-rows`, `report` and `repair {patch,rollback,reset}`. Repair rolls back the sidecar's block store with fabric-x-common's
     existing `blkstorage.Rollback`, and tracks the evidence clones it creates (see
     [Clone lifecycle](#clone-lifecycle)).
 
@@ -573,7 +591,11 @@ already in the flow. It remains an [open question](#unresolved-questions).
 - **Monotonic buckets:** for random and adversarial keys, the bucket number never decreases in
   primary-key order.
 - **Determinism:** the same content hashed with different page sizes, worker counts and table
-  completion orders produces byte-identical digest files.
+  completion orders produces byte-identical exported digest files.
+- **Atomic storage:** a hasher stopped mid-job leaves no stored digests, and a `COMPLETED` record
+  always has them.
+- **Export and compare:** compare refuses a peer file whose snapshot block, K or format version
+  differs from the local record.
 - **Localization:** inject a modified value, a missing row and an extra row into a clone. Compare must
   report exactly the affected buckets and rows, and nothing else.
 - **Report:** a differing key must name the transaction that wrote it, at the right block and
@@ -607,10 +629,10 @@ To resolve through the RFC process:
 - **How digests and rows are exchanged.** Strictly out-of-band files, as SDLR proposes, or a
   committer API? A file fits the human step and the halted committer, but an API would allow
   automation.
-- **Where the digests are stored.** In a table in the state database, which needs a new exclusion
-  from hashing and writes 2^K rows per table per snapshot? In the `_snapshot` record, which the
-  hasher's scheduler reads on every poll? Or in a file beside the clone, which is easy for tools but
-  makes durability and discovery the hasher's responsibility?
+- **Which database structure holds the digests.** A new table keyed by snapshot, table and bucket,
+  which needs a new exclusion from hashing and writes up to 2^K rows per table per snapshot? Or a
+  field on the `_snapshot` record, which avoids the table, but which `committer db clone list` and the
+  hasher's scheduler would then read far more often than the digests are used?
 - **Skewed application keys.** Accept the skew, give each table its own K, or bucket user namespaces
   by `H(key)` and accept that a differing bucket must be rescanned with a full scan?
 - **Multi-organization coordination.** Does a rollback need coordinated action across organizations,
@@ -619,8 +641,7 @@ To resolve through the RFC process:
 To resolve during implementation:
 
 - The exact permitted range of K and its default.
-- The CLI command names, and whether they belong under the existing `committer db` group, in a new
-  group, or in a separate tool.
+- The exact flags of the `committer db divergence` commands.
 - How the tool detects that no committer service is connected to the database.
 
 Out of scope:
